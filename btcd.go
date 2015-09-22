@@ -1,4 +1,4 @@
-// Copyright (c) 2013 Conformal Systems LLC.
+// Copyright (c) 2013-2014 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
@@ -6,150 +6,132 @@ package main
 
 import (
 	"fmt"
-	"github.com/conformal/btcchain"
-	"github.com/conformal/btcdb"
-	"github.com/conformal/btcscript"
-	"github.com/conformal/seelog"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"runtime"
-)
+	"runtime/pprof"
 
-// These constants are used by the dns seed code to pick a random last seen
-// time.
-const (
-	secondsIn3Days int32 = 24 * 60 * 60 * 3
-	secondsIn4Days int32 = 24 * 60 * 60 * 4
+	"github.com/btcsuite/btcd/limits"
 )
 
 var (
-	log = seelog.Disabled
-	cfg *config
+	cfg             *config
+	shutdownChannel = make(chan struct{})
 )
 
-// newLogger creates a new seelog logger using the provided logging level and
-// log message prefix.
-func newLogger(level string, prefix string) seelog.LoggerInterface {
-	fmtstring := `
-	<seelog type="adaptive" mininterval="2000000" maxinterval="100000000"
-		critmsgcount="500" minlevel="%s">
-		<outputs formatid="all">
-			<console/>
-		</outputs>
-		<formats>
-			<format id="all" format="[%%Time %%Date] [%%LEV] [%s] %%Msg%%n" />
-		</formats>
-	</seelog>`
-	config := fmt.Sprintf(fmtstring, level, prefix)
-
-	logger, err := seelog.LoggerFromConfigAsString(config)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to create logger: %v", err)
-		os.Exit(1)
-	}
-
-	return logger
-}
-
-// useLogger sets the btcd logger to the passed logger.
-func useLogger(logger seelog.LoggerInterface) {
-	log = logger
-}
-
-// setLogLevel sets the log level for the logging system.  It initialises a
-// logger for each subsystem at the provided level.
-func setLogLevel(logLevel string) []seelog.LoggerInterface {
-	var loggers []seelog.LoggerInterface
-
-	// Define sub-systems.
-	subSystems := []struct {
-		level     string
-		prefix    string
-		useLogger func(seelog.LoggerInterface)
-	}{
-		{logLevel, "BTCD", useLogger},
-		{logLevel, "BCDB", btcdb.UseLogger},
-		{logLevel, "CHAN", btcchain.UseLogger},
-		{logLevel, "SCRP", btcscript.UseLogger},
-	}
-
-	// Configure all sub-systems with new loggers while keeping track of
-	// the created loggers to return so they can be flushed.
-	for _, s := range subSystems {
-		newLog := newLogger(s.level, s.prefix)
-		loggers = append(loggers, newLog)
-		s.useLogger(newLog)
-	}
-
-	return loggers
-}
+// winServiceMain is only invoked on Windows.  It detects when btcd is running
+// as a service and reacts accordingly.
+var winServiceMain func() (bool, error)
 
 // btcdMain is the real main function for btcd.  It is necessary to work around
-// the fact that deferred functions do not run when os.Exit() is called.
-func btcdMain() error {
-	// Initialize logging and setup deferred flushing to ensure all
-	// outstanding messages are written on shutdown.
-	loggers := setLogLevel(defaultLogLevel)
-	defer func() {
-		for _, logger := range loggers {
-			logger.Flush()
-		}
-	}()
-
-	// Load configuration and parse command line.
+// the fact that deferred functions do not run when os.Exit() is called.  The
+// optional serverChan parameter is mainly used by the service code to be
+// notified with the server once it is setup so it can gracefully stop it when
+// requested from the service control manager.
+func btcdMain(serverChan chan<- *server) error {
+	// Load configuration and parse command line.  This function also
+	// initializes logging and configures it accordingly.
 	tcfg, _, err := loadConfig()
 	if err != nil {
 		return err
 	}
 	cfg = tcfg
+	defer backendLog.Flush()
 
-	// Change the logging level if needed.
-	if cfg.DebugLevel != defaultLogLevel {
-		loggers = setLogLevel(cfg.DebugLevel)
-	}
+	// Show version at startup.
+	btcdLog.Infof("Version %s", version())
 
-	// See if we want to enable profiling.
+	// Enable http profiling server if requested.
 	if cfg.Profile != "" {
 		go func() {
 			listenAddr := net.JoinHostPort("", cfg.Profile)
-			log.Infof("[BTCD] Profile server listening on %s", listenAddr)
-			log.Errorf("%v", http.ListenAndServe(listenAddr, nil))
+			btcdLog.Infof("Profile server listening on %s", listenAddr)
+			profileRedirect := http.RedirectHandler("/debug/pprof",
+				http.StatusSeeOther)
+			http.Handle("/", profileRedirect)
+			btcdLog.Errorf("%v", http.ListenAndServe(listenAddr, nil))
 		}()
 	}
 
+	// Write cpu profile if requested.
+	if cfg.CPUProfile != "" {
+		f, err := os.Create(cfg.CPUProfile)
+		if err != nil {
+			btcdLog.Errorf("Unable to create cpu profile: %v", err)
+			return err
+		}
+		pprof.StartCPUProfile(f)
+		defer f.Close()
+		defer pprof.StopCPUProfile()
+	}
+
 	// Perform upgrades to btcd as new versions require it.
-	err = doUpgrades()
-	if err != nil {
-		log.Errorf("%v", err)
+	if err := doUpgrades(); err != nil {
+		btcdLog.Errorf("%v", err)
 		return err
 	}
 
 	// Load the block database.
 	db, err := loadBlockDB()
 	if err != nil {
-		log.Errorf("%v", err)
+		btcdLog.Errorf("%v", err)
 		return err
 	}
 	defer db.Close()
 
+	if cfg.DropAddrIndex {
+		btcdLog.Info("Deleting entire addrindex.")
+		err := db.DeleteAddrIndex()
+		if err != nil {
+			btcdLog.Errorf("Unable to delete the addrindex: %v", err)
+			return err
+		}
+		btcdLog.Info("Successfully deleted addrindex, exiting")
+		return nil
+	}
+
 	// Ensure the database is sync'd and closed on Ctrl+C.
 	addInterruptHandler(func() {
+		btcdLog.Infof("Gracefully shutting down the database...")
 		db.RollbackClose()
 	})
 
 	// Create server and start it.
-	listenAddr := net.JoinHostPort("", cfg.Port)
-	server, err := newServer(listenAddr, db, activeNetParams.btcnet)
+	server, err := newServer(cfg.Listeners, db, activeNetParams.Params)
 	if err != nil {
-		log.Errorf("Unable to start server on %v", listenAddr)
-		log.Errorf("%v", err)
+		// TODO(oga) this logging could do with some beautifying.
+		btcdLog.Errorf("Unable to start server on %v: %v",
+			cfg.Listeners, err)
 		return err
 	}
+	addInterruptHandler(func() {
+		btcdLog.Infof("Gracefully shutting down the server...")
+		server.Stop()
+		server.WaitForShutdown()
+	})
 	server.Start()
+	if serverChan != nil {
+		serverChan <- server
+	}
 
-	server.WaitForShutdown()
+	// Monitor for graceful server shutdown and signal the main goroutine
+	// when done.  This is done in a separate goroutine rather than waiting
+	// directly so the main goroutine can be signaled for shutdown by either
+	// a graceful shutdown or from the main interrupt handler.  This is
+	// necessary since the main goroutine must be kept running long enough
+	// for the interrupt handler goroutine to finish.
+	go func() {
+		server.WaitForShutdown()
+		srvrLog.Infof("Server shutdown complete")
+		shutdownChannel <- struct{}{}
+	}()
+
+	// Wait for shutdown signal from either a graceful server stop or from
+	// the interrupt handler.
+	<-shutdownChannel
+	btcdLog.Info("Shutdown complete")
 	return nil
 }
 
@@ -157,9 +139,28 @@ func main() {
 	// Use all processor cores.
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
+	// Up some limits.
+	if err := limits.SetLimits(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to set limits: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Call serviceMain on Windows to handle running as a service.  When
+	// the return isService flag is true, exit now since we ran as a
+	// service.  Otherwise, just fall through to normal operation.
+	if runtime.GOOS == "windows" {
+		isService, err := winServiceMain()
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		if isService {
+			os.Exit(0)
+		}
+	}
+
 	// Work around defer not working after os.Exit()
-	err := btcdMain()
-	if err != nil {
+	if err := btcdMain(nil); err != nil {
 		os.Exit(1)
 	}
 }
